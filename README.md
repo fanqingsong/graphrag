@@ -224,6 +224,7 @@ Edit `config/settings.py` for fine-tuning:
 
 ## 📚 Documentation
 
+- **[GraphRAG 原理详解](docs/GRAPH_RAG_EXPLAINED.md)**: 详细解释 Graph 如何增强检索和生成
 - **[Setup Guide](SETUP_V2.md)**: Comprehensive setup instructions
 - **[Migration Guide](MIGRATION_V2.md)**: Migrating from v1.x
 - **[Frontend README](frontend/README.md)**: Frontend-specific documentation
