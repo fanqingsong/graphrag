@@ -422,12 +422,30 @@ AI领域的投资正在快速增长。Microsoft、Google等科技巨头都在加
 
 ### 代码实现详解
 
+#### 快速概览
+
+| 步骤 | 实现位置 | 核心功能 | 关键代码/函数 |
+|------|---------|---------|--------------|
+| **步骤1-2：查询分析** | `rag/nodes/query_analysis.py` | 分析查询类型、复杂度、关键概念，决定是否使用多跳推理 | `analyze_query()` |
+| **步骤3：生成向量嵌入** | `rag/retriever.py`<br>`core/embeddings.py` | 将查询文本转换为向量 | `embedding_manager.get_embedding(query)` |
+| **步骤4：向量相似度搜索** | `core/graph_db.py` | 使用GDS插件计算余弦相似度，找到最相关的Chunks | `vector_similarity_search()`<br>`gds.similarity.cosine()` |
+| **步骤5-6：图扩展和多跳推理** | `rag/nodes/graph_reasoning.py` | 通过图关系扩展初始检索结果 | `reason_with_graph()`<br>`get_related_chunks()` |
+| **完整调用链** | `rag/graph_rag.py` | LangGraph工作流编排 | `graph_rag.query()` → 各节点 |
+
 #### 步骤1-2：用户查询和查询分析
 
 **实现位置**：`rag/nodes/query_analysis.py`
 
-查询分析通过 `analyze_query()` 函数实现：
+**功能**：分析查询类型、复杂度、关键概念，决定是否使用多跳推理
 
+**主要功能**：
+- 检测是否为后续问题（follow-up question）
+- 使用 LLM 分析查询意图
+- 提取关键概念
+- 判断查询类型（factual, analytical, comparative）和复杂度（simple, complex）
+- 决定是否使用多跳推理
+
+**核心函数**：
 ```python
 def analyze_query(query: str, chat_history: Optional[List[Dict[str, str]]] = None) -> Dict[str, Any]:
     """
@@ -441,13 +459,6 @@ def analyze_query(query: str, chat_history: Optional[List[Dict[str, str]]] = Non
     - multi_hop_recommended: 是否推荐多跳推理
     """
 ```
-
-**主要功能**：
-- 检测是否为后续问题（follow-up question）
-- 使用 LLM 分析查询意图
-- 提取关键概念
-- 判断查询类型和复杂度
-- 决定是否使用多跳推理
 
 **代码位置**：
 ```13:230:rag/nodes/query_analysis.py
@@ -692,6 +703,8 @@ def analyze_query(
 
 **实现位置**：`rag/retriever.py` 和 `core/embeddings.py`
 
+**功能**：使用 `embedding_manager.get_embedding(query)` 将查询转换为向量
+
 在检索过程中，查询文本会被转换为向量嵌入：
 
 ```python
@@ -730,12 +743,14 @@ query_embedding = embedding_manager.get_embedding(query)
 
 **实现位置**：`core/graph_db.py` 的 `vector_similarity_search()` 方法
 
-这是关键步骤！**Neo4j 本身不直接支持向量搜索，但通过 GDS (Graph Data Science) 插件可以实现**。
+**关于"Neo4j 是否有向量搜索功能"**：
 
-**重要说明**：
-- Neo4j 使用 **GDS (Graph Data Science)** 插件的 `gds.similarity.cosine()` 函数来计算余弦相似度
-- 向量数据存储在 Chunk 节点的 `embedding` 属性中（一个浮点数数组）
-- 查询向量通过参数传入，与数据库中所有 Chunk 的向量进行比较
+**重要说明**：Neo4j 本身不直接支持向量搜索，但可通过 **GDS (Graph Data Science) 插件**实现
+
+**实现方式**：
+- 向量存储在 Chunk 节点的 `embedding` 属性中
+- 使用 GDS 插件的 `gds.similarity.cosine()` 函数计算余弦相似度
+- 在 Cypher 查询中实时计算相似度
 
 **代码实现**：
 ```486:503:core/graph_db.py
@@ -759,13 +774,20 @@ query_embedding = embedding_manager.get_embedding(query)
             return [record.data() for record in result]
 ```
 
+**核心代码**（Cypher查询）：
+```cypher
+MATCH (d:Document)-[:HAS_CHUNK]->(c:Chunk)
+WITH c, d, gds.similarity.cosine(c.embedding, $query_embedding) AS similarity
+RETURN c.id as chunk_id, c.content as content, similarity
+ORDER BY similarity DESC
+LIMIT $top_k
+```
+
 **工作原理**：
-1. **Cypher 查询**：使用 `MATCH` 找到所有 Document 和它们的 Chunk
-2. **余弦相似度计算**：`gds.similarity.cosine(c.embedding, $query_embedding)` 
-   - `c.embedding`：Chunk 节点存储的向量（在文档处理时生成）
-   - `$query_embedding`：用户查询的向量（在检索时生成）
-   - 返回相似度分数（0-1之间）
-3. **排序和限制**：按相似度降序排序，返回 top_k 个结果
+1. `c.embedding`：Chunk 节点存储的向量（文档处理时生成）
+2. `$query_embedding`：用户查询的向量（检索时生成）
+3. `gds.similarity.cosine()`：计算两个向量的余弦相似度（0-1之间）
+4. 按相似度排序，返回 top_k 个结果
 
 **GDS 插件说明**：
 - GDS (Graph Data Science) 是 Neo4j 的官方插件
@@ -782,6 +804,8 @@ neo4j:
 #### 步骤5-6：图扩展和多跳推理
 
 **实现位置**：`rag/nodes/graph_reasoning.py`
+
+**功能**：通过图关系扩展初始检索结果
 
 在向量搜索找到初始 Chunks 后，通过图关系扩展上下文：
 
@@ -870,7 +894,9 @@ def reason_with_graph(
         return retrieved_chunks  # Return original chunks on error
 ```
 
-#### 完整流程调用链
+#### 步骤5：完整调用链
+
+**功能**：展示了从 `graph_rag.query()` 到各个节点的完整调用流程
 
 **入口**：`rag/graph_rag.py` 的 `query()` 方法
 ```python
@@ -881,10 +907,10 @@ graph_rag.query(
 )
 ```
 
-**流程节点**：
-1. `_analyze_query_node()` → 调用 `analyze_query()`
-2. `_retrieve_documents_node()` → 调用 `retrieve_documents()`
-3. `_reason_with_graph_node()` → 调用 `reason_with_graph()`
+**流程节点**（LangGraph工作流）：
+1. `_analyze_query_node()` → 调用 `analyze_query()`（步骤1-2）
+2. `_retrieve_documents_node()` → 调用 `retrieve_documents()`（步骤3-4）
+3. `_reason_with_graph_node()` → 调用 `reason_with_graph()`（步骤5-6）
 4. `_generate_response_node()` → 调用 LLM 生成答案
 
 **代码位置**：
