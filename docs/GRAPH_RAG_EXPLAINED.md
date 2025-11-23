@@ -420,6 +420,547 @@ AI领域的投资正在快速增长。Microsoft、Google等科技巨头都在加
 8. 传递给 LLM 生成答案
 ```
 
+### 代码实现详解
+
+#### 步骤1-2：用户查询和查询分析
+
+**实现位置**：`rag/nodes/query_analysis.py`
+
+查询分析通过 `analyze_query()` 函数实现：
+
+```python
+def analyze_query(query: str, chat_history: Optional[List[Dict[str, str]]] = None) -> Dict[str, Any]:
+    """
+    分析用户查询，提取意图和关键概念
+    
+    返回：
+    - query_type: 查询类型（factual, analytical, comparative）
+    - complexity: 复杂度（simple, complex）
+    - key_concepts: 关键概念列表
+    - requires_reasoning: 是否需要推理
+    - multi_hop_recommended: 是否推荐多跳推理
+    """
+```
+
+**主要功能**：
+- 检测是否为后续问题（follow-up question）
+- 使用 LLM 分析查询意图
+- 提取关键概念
+- 判断查询类型和复杂度
+- 决定是否使用多跳推理
+
+**代码位置**：
+```13:230:rag/nodes/query_analysis.py
+def analyze_query(
+    query: str, chat_history: Optional[List[Dict[str, str]]] = None
+) -> Dict[str, Any]:
+    """
+    Analyze user query to extract intent and key concepts.
+
+    Args:
+        query: User query string
+        chat_history: Optional list of previous messages [{"role": "user/assistant", "content": "..."}]
+
+    Returns:
+        Dictionary containing query analysis
+    """
+    try:
+        # Check if this is a follow-up question
+        is_follow_up = False
+        needs_context = False
+        context_query = query  # The enriched query with context if needed
+
+        if chat_history and len(chat_history) >= 2:
+            # Detect follow-up questions using LLM
+            follow_up_detection = _detect_follow_up_question(query, chat_history)
+            is_follow_up = follow_up_detection.get("is_follow_up", False)
+            needs_context = follow_up_detection.get("needs_context", False)
+
+            if is_follow_up and needs_context:
+                # Create a contextualized version of the query
+                context_query = _create_contextualized_query(query, chat_history)
+                logger.info(
+                    f"Follow-up question detected. Original: '{query}' -> Contextualized: '{context_query}'"
+                )
+
+        # Use LLM to analyze the query (using contextualized version if needed)
+        analysis_result = llm_manager.analyze_query(context_query)
+
+        # Extract key information (simplified version)
+        analysis = {
+            "original_query": query,
+            "contextualized_query": context_query,
+            "is_follow_up": is_follow_up,
+            "needs_context": needs_context,
+            "query_type": "factual",  # Default type
+            "key_concepts": [],
+            "intent": "information_seeking",
+            "complexity": "simple",
+            "analysis_text": analysis_result.get("analysis", ""),
+            "requires_reasoning": False,
+            "requires_multiple_sources": False,
+        }
+
+        # Simple heuristics to enhance analysis (use contextualized query for better analysis)
+        query_lower = context_query.lower()
+
+        # Detect question types
+        if any(
+            word in query_lower
+            for word in ["compare", "difference", "vs", "versus", "contrast"]
+        ):
+            analysis["query_type"] = "comparative"
+            analysis["requires_multiple_sources"] = True
+            analysis["requires_reasoning"] = True
+        elif any(
+            word in query_lower
+            for word in [
+                "why",
+                "how",
+                "explain",
+                "reason",
+                "analyze",
+                "relationship",
+                "connection",
+            ]
+        ):
+            analysis["query_type"] = "analytical"
+            analysis["requires_reasoning"] = True
+        elif any(word in query_lower for word in ["what", "who", "when", "where"]):
+            analysis["query_type"] = "factual"
+
+        # Detect complexity
+        if len(query.split()) > 10 or "and" in query_lower or "or" in query_lower:
+            analysis["complexity"] = "complex"
+            analysis["requires_multiple_sources"] = True
+
+        # Extract potential key concepts (simple keyword extraction)
+        # Skip common words
+        stop_words = {
+            "what",
+            "how",
+            "why",
+            "when",
+            "where",
+            "who",
+            "which",
+            "that",
+            "this",
+            "is",
+            "are",
+            "was",
+            "were",
+            "be",
+            "been",
+            "have",
+            "has",
+            "had",
+            "do",
+            "does",
+            "did",
+            "will",
+            "would",
+            "could",
+            "should",
+            "may",
+            "might",
+            "can",
+            "the",
+            "a",
+            "an",
+            "and",
+            "or",
+            "but",
+            "in",
+            "on",
+            "at",
+            "to",
+            "for",
+            "of",
+            "with",
+            "by",
+            "from",
+            "about",
+            "into",
+            "through",
+            "during",
+            "before",
+            "after",
+            "above",
+            "below",
+            "up",
+            "down",
+            "out",
+            "off",
+            "over",
+            "under",
+            "again",
+            "further",
+            "then",
+            "once",
+        }
+
+        words = query_lower.replace("?", "").replace("!", "").replace(",", "").split()
+        key_concepts = [
+            word for word in words if len(word) > 2 and word not in stop_words
+        ]
+        analysis["key_concepts"] = key_concepts[:5]  # Limit to top 5 concepts
+
+        # Determine if multi-hop reasoning would be beneficial
+        multi_hop_beneficial = False
+
+        # Multi-hop is beneficial for:
+        # 1. Comparative queries (need to connect multiple entities)
+        if analysis["query_type"] == "comparative":
+            multi_hop_beneficial = True
+
+        # 2. Analytical queries that need reasoning (relationships, explanations)
+        elif analysis["query_type"] == "analytical" and analysis["requires_reasoning"]:
+            multi_hop_beneficial = True
+
+        # 3. Complex queries with multiple concepts
+        elif analysis["complexity"] == "complex" and len(key_concepts) >= 3:
+            multi_hop_beneficial = True
+
+        # 4. Queries explicitly asking for relationships or connections
+        elif any(
+            word in query_lower
+            for word in [
+                "relationship",
+                "connection",
+                "related",
+                "link",
+                "connect",
+                "between",
+            ]
+        ):
+            multi_hop_beneficial = True
+
+        # 5. Queries asking about trends, patterns, or implications
+        elif any(
+            word in query_lower
+            for word in [
+                "trend",
+                "pattern",
+                "impact",
+                "effect",
+                "influence",
+                "implication",
+            ]
+        ):
+            multi_hop_beneficial = True
+
+        # Multi-hop is NOT beneficial for:
+        # 1. Simple factual lookups (addresses, names, single facts)
+        # 2. Direct "what is X" questions about specific entities
+        # 3. Simple definition requests
+        if (
+            analysis["query_type"] == "factual"
+            and analysis["complexity"] == "simple"
+            and len(key_concepts) <= 2
+            and not analysis["requires_multiple_sources"]
+        ):
+            multi_hop_beneficial = False
+
+        analysis["multi_hop_recommended"] = multi_hop_beneficial
+
+        logger.info(
+            f"Query analysis completed: {analysis['query_type']}, {len(key_concepts)} concepts, "
+            f"multi-hop recommended: {multi_hop_beneficial}, is_follow_up: {is_follow_up}"
+        )
+        return analysis
+
+    except Exception as e:
+        logger.error(f"Query analysis failed: {e}")
+        return {
+            "original_query": query,
+            "contextualized_query": query,
+            "is_follow_up": False,
+            "needs_context": False,
+            "query_type": "factual",
+            "key_concepts": [],
+            "intent": "information_seeking",
+            "complexity": "simple",
+            "analysis_text": "",
+            "requires_reasoning": False,
+            "requires_multiple_sources": False,
+            "error": str(e),
+        }
+```
+
+#### 步骤3：生成查询向量嵌入
+
+**实现位置**：`rag/retriever.py` 和 `core/embeddings.py`
+
+在检索过程中，查询文本会被转换为向量嵌入：
+
+```python
+# 在 chunk_based_retrieval 中
+query_embedding = embedding_manager.get_embedding(query)
+```
+
+**代码位置**：
+```89:111:rag/retriever.py
+    async def chunk_based_retrieval(
+        self,
+        query: str,
+        top_k: int = 5,
+        allowed_document_ids: Optional[List[str]] = None,
+        query_embedding: Optional[List[float]] = None,
+    ) -> List[Dict[str, Any]]:
+        """
+        Traditional chunk-based retrieval using vector similarity.
+
+        Args:
+            query: User query
+            top_k: Number of similar chunks to retrieve
+            allowed_document_ids: Optional list of document IDs to restrict retrieval
+            query_embedding: Pre-computed query embedding (to avoid recomputation)
+
+        Returns:
+            List of similar chunks with metadata
+        """
+        try:
+            # Generate query embedding if not provided
+            if query_embedding is None:
+                query_embedding = embedding_manager.get_embedding(query)
+```
+
+#### 步骤4：向量相似度搜索 ⭐
+
+**实现位置**：`core/graph_db.py` 的 `vector_similarity_search()` 方法
+
+这是关键步骤！**Neo4j 本身不直接支持向量搜索，但通过 GDS (Graph Data Science) 插件可以实现**。
+
+**重要说明**：
+- Neo4j 使用 **GDS (Graph Data Science)** 插件的 `gds.similarity.cosine()` 函数来计算余弦相似度
+- 向量数据存储在 Chunk 节点的 `embedding` 属性中（一个浮点数数组）
+- 查询向量通过参数传入，与数据库中所有 Chunk 的向量进行比较
+
+**代码实现**：
+```486:503:core/graph_db.py
+    def vector_similarity_search(
+        self, query_embedding: List[float], top_k: int = 5
+    ) -> List[Dict[str, Any]]:
+        """Perform vector similarity search using cosine similarity."""
+        with self.driver.session() as session:  # type: ignore
+            result = session.run(
+                """
+                MATCH (d:Document)-[:HAS_CHUNK]->(c:Chunk)
+                WITH c, d, gds.similarity.cosine(c.embedding, $query_embedding) AS similarity
+                RETURN c.id as chunk_id, c.content as content, similarity,
+                       coalesce(d.original_filename, d.filename) as document_name, d.id as document_id
+                ORDER BY similarity DESC
+                LIMIT $top_k
+                """,
+                query_embedding=query_embedding,
+                top_k=top_k,
+            )
+            return [record.data() for record in result]
+```
+
+**工作原理**：
+1. **Cypher 查询**：使用 `MATCH` 找到所有 Document 和它们的 Chunk
+2. **余弦相似度计算**：`gds.similarity.cosine(c.embedding, $query_embedding)` 
+   - `c.embedding`：Chunk 节点存储的向量（在文档处理时生成）
+   - `$query_embedding`：用户查询的向量（在检索时生成）
+   - 返回相似度分数（0-1之间）
+3. **排序和限制**：按相似度降序排序，返回 top_k 个结果
+
+**GDS 插件说明**：
+- GDS (Graph Data Science) 是 Neo4j 的官方插件
+- 提供各种图算法和相似度计算函数
+- 需要在 Neo4j 中安装并启用（项目中的 docker-compose.yml 已配置）
+
+**配置位置**（docker-compose.yml）：
+```yaml
+neo4j:
+  environment:
+    - NEO4J_PLUGINS=["graph-data-science"]
+```
+
+#### 步骤5-6：图扩展和多跳推理
+
+**实现位置**：`rag/nodes/graph_reasoning.py`
+
+在向量搜索找到初始 Chunks 后，通过图关系扩展上下文：
+
+```13:90:rag/nodes/graph_reasoning.py
+def reason_with_graph(
+    query: str,
+    retrieved_chunks: List[Dict[str, Any]],
+    query_analysis: Dict[str, Any],
+    retrieval_mode: str = "graph_enhanced",
+) -> List[Dict[str, Any]]:
+    """
+    Perform graph-based reasoning to enhance context.
+
+    Args:
+        query: User query string
+        retrieved_chunks: Initially retrieved chunks
+        query_analysis: Query analysis results
+
+    Returns:
+        Enhanced list of chunks with graph context
+    """
+    try:
+        if not retrieved_chunks:
+            logger.warning("No retrieved chunks for graph reasoning")
+            return []
+
+        enhanced_chunks = list(retrieved_chunks)  # Start with original chunks
+
+        # If retrieval mode explicitly requests simple retrieval, skip reasoning.
+        if retrieval_mode == "simple":
+            logger.info("Retrieval mode is 'simple' - skipping graph reasoning")
+            return enhanced_chunks
+
+        # For chunk_only mode, skip graph reasoning entirely
+        if retrieval_mode == "chunk_only":
+            logger.info("Chunk-only mode selected - skipping graph reasoning")
+            return enhanced_chunks
+
+        # For entity_only and hybrid modes, always run graph reasoning to respect user's choice
+        logger.info(f"Running graph reasoning for {retrieval_mode} mode")
+
+        # Find related chunks through graph traversal
+        seen_chunk_ids = {chunk.get("chunk_id") for chunk in retrieved_chunks}
+
+        for chunk in retrieved_chunks[:3]:  # Only expand from top 3 chunks
+            chunk_id = chunk.get("chunk_id")
+            if not chunk_id:
+                continue
+
+            try:
+                # Get chunks related through graph relationships
+                related_chunks = graph_db.get_related_chunks(
+                    chunk_id=chunk_id,
+                    relationship_types=["SIMILAR_TO", "HAS_CHUNK"],
+                    max_depth=2,  # Keep it shallow for performance
+                )
+
+                # Add unique related chunks
+                for related_chunk in related_chunks:
+                    related_id = related_chunk.get("chunk_id")
+                    if related_id and related_id not in seen_chunk_ids:
+                        # Add relationship context to metadata
+                        related_chunk["reasoning_context"] = {
+                            "related_to": chunk_id,
+                            "relationship_type": "graph_expansion",
+                            "distance": related_chunk.get("distance", 1),
+                        }
+                        enhanced_chunks.append(related_chunk)
+                        seen_chunk_ids.add(related_id)
+
+                        # Limit total chunks to prevent overwhelming the LLM
+                        if len(enhanced_chunks) >= 10:
+                            break
+
+            except Exception as e:
+                logger.warning(f"Failed to get related chunks for {chunk_id}: {e}")
+                continue
+
+        logger.info(
+            f"Graph reasoning: {len(retrieved_chunks)} -> {len(enhanced_chunks)} chunks"
+        )
+        return enhanced_chunks
+
+    except Exception as e:
+        logger.error(f"Graph reasoning failed: {e}")
+        return retrieved_chunks  # Return original chunks on error
+```
+
+#### 完整流程调用链
+
+**入口**：`rag/graph_rag.py` 的 `query()` 方法
+```python
+graph_rag.query(
+    user_query="什么是机器学习？",
+    retrieval_mode="hybrid",
+    top_k=5
+)
+```
+
+**流程节点**：
+1. `_analyze_query_node()` → 调用 `analyze_query()`
+2. `_retrieve_documents_node()` → 调用 `retrieve_documents()`
+3. `_reason_with_graph_node()` → 调用 `reason_with_graph()`
+4. `_generate_response_node()` → 调用 LLM 生成答案
+
+**代码位置**：
+```65:120:rag/graph_rag.py
+    def _analyze_query_node(self, state) -> Any:
+        """Analyze the user query (dict-based state for LangGraph)."""
+        try:
+            query = state.get("query", "")
+            chat_history = state.get("chat_history", [])
+            logger.info(f"Analyzing query: {query}")
+            
+            # Initialize stages list if not present
+            if "stages" not in state:
+                state["stages"] = []
+            
+            # Track stage
+            state["stages"].append("query_analysis")
+            logger.info(f"Stage query_analysis completed, current stages: {state['stages']}")
+            
+            state["query_analysis"] = analyze_query(query, chat_history)
+            return state
+        except Exception as e:
+            logger.error(f"Query analysis failed: {e}")
+            state["query_analysis"] = {"error": str(e)}
+            return state
+
+    def _retrieve_documents_node(self, state) -> Any:
+        """Retrieve relevant documents (dict-based state for LangGraph)."""
+        try:
+            logger.info("Retrieving relevant documents")
+            
+            # Initialize stages list if not present
+            if "stages" not in state:
+                state["stages"] = []
+            
+            # Track retrieval stage
+            state["stages"].append("retrieval")
+            logger.info(f"Stage retrieval completed, current stages: {state['stages']}")
+            
+            # Pass additional retrieval tuning parameters from state
+            chunk_weight = state.get("chunk_weight", 0.5)
+            graph_expansion = state.get("graph_expansion", True)
+            use_multi_hop = state.get("use_multi_hop", False)
+
+            state["retrieved_chunks"] = retrieve_documents(
+                state.get("query", ""),
+                state.get("query_analysis", {}),
+                state.get("retrieval_mode", "graph_enhanced"),
+                state.get("top_k", 5),
+                chunk_weight=chunk_weight,
+                graph_expansion=graph_expansion,
+                use_multi_hop=use_multi_hop,
+                context_documents=state.get("context_documents", []),
+            )
+            
+            return state
+        except Exception as e:
+            logger.error(f"Document retrieval failed: {e}")
+            state["retrieved_chunks"] = []
+            return state
+```
+
+### 关于 Neo4j 向量搜索的说明
+
+**重要理解**：
+1. **Neo4j 本身不直接支持向量搜索**，但可以通过 GDS 插件实现
+2. **向量数据存储**：向量作为节点属性存储在 `c.embedding` 中
+3. **相似度计算**：使用 `gds.similarity.cosine()` 函数在查询时计算
+4. **性能考虑**：对于大规模数据，可能需要使用专门的向量数据库（如 Pinecone、Weaviate）或 Neo4j 的向量索引功能（如果可用）
+
+**当前实现**：
+- ✅ 使用 GDS 插件的余弦相似度函数
+- ✅ 向量存储在节点属性中
+- ✅ 查询时实时计算相似度
+- ⚠️ 对于超大规模数据，可能需要优化（如使用向量索引）
+
 ### 检索模式对比
 
 | 模式 | 向量搜索 | 图扩展 | 多跳推理 | 适用场景 |
